@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+node_modules/
+dist/
+*.db
+*.sqlite3
+.pytest_cache/
+opsloop.egg-info/
+
+# This repo holds code only. docs/ is a local scratch area; publish a file
+# from it by adding an explicit exception below.
+docs/*
+!docs/DISCORD_SETUP.md

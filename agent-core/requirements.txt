@@ -1,0 +1,22 @@
+# --- agent core ---
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32,<1.0
+pydantic>=2.9,<3.0
+pydantic-settings>=2.6,<3.0
+httpx>=0.27,<1.0
+python-dotenv>=1.0,<2.0
+
+# --- telemetry adapters ---
+docker>=7.1,<8.0          # docker adapter (local + remote daemon)
+paramiko>=3.5,<4.0        # ssh adapter (journald, nginx, log files)
+
+# --- storage ---
+aiosqlite>=0.20,<1.0
+
+# --- dev / test ---
+pytest>=8.3,<9.0
+pytest-asyncio>=0.24,<1.0
+respx>=0.21,<1.0          # httpx mocking, so provider tests need no API key
+
+# --- chat surfaces ---
+discord.py>=2.4,<3.0      # discord surface

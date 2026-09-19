@@ -1,0 +1,27 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+  external_labels:
+    environment: production
+    stack: opsloop-demo
+
+scrape_configs:
+  - job_name: orders-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["orders-api:8080"]
+        labels:
+          service: orders-api
+          tier: frontend
+
+  - job_name: payments-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["payments-api:8080"]
+        labels:
+          service: payments-api
+          tier: dependency
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

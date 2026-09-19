@@ -1,0 +1,106 @@
+# Discord bot setup
+
+Ten minutes, no tenant, no admin approval, no cost.
+
+## 1. Create the application
+
+1. Go to <https://discord.com/developers/applications> → **New Application**.
+   Name it `OpsLoop`.
+2. **Bot** tab → **Reset Token** → copy it. This is the only time it is shown.
+   It is a credential: put it in `.env`, never in the repo.
+3. On the same tab, under **Privileged Gateway Intents**, enable
+   **MESSAGE CONTENT INTENT**.
+
+> **Do not skip the intent.** Without it the bot connects, slash commands
+> work, and `@OpsLoop what's broken?` silently does nothing — because message
+> bodies arrive empty. It looks like a broken bot rather than a missing
+> checkbox, and it is the single most common setup mistake. Set
+> `OPSLOOP_DISCORD_MESSAGE_CHAT=false` if you deliberately want slash commands
+> only.
+
+## 2. Invite it to a server
+
+**OAuth2 → URL Generator**:
+
+- Scopes: `bot`, `applications.commands`
+- Bot permissions: `Send Messages`, `Embed Links`, `Read Message History`,
+  `Use Slash Commands`
+
+Open the generated URL and add it to a server you own. Create a server first if
+you need one — it takes seconds and you get admin on it automatically.
+
+## 3. Get the IDs
+
+Enable **User Settings → Advanced → Developer Mode**, then right-click →
+**Copy ID** on:
+
+- the **server** (guild) — commands sync there instantly; global commands can
+  take up to an hour to appear, which is unusable while iterating
+- the **channel** OpsLoop should post incidents into
+
+## 4. Configure
+
+`agent-core/.env`:
+
+```
+OPSLOOP_DISCORD_TOKEN=your-bot-token
+OPSLOOP_DISCORD_GUILD_ID=123456789012345678
+OPSLOOP_DISCORD_CHANNEL_ID=123456789012345678
+OPSLOOP_DISCORD_ADMIN_ROLE=SRE        # optional; defaults to server admins
+OPSLOOP_DISCORD_MESSAGE_CHAT=true
+```
+
+`.env` is already in `.gitignore`. **A leaked bot token lets anyone drive your
+agent** — including approving its actions. If it ever lands in a commit,
+screenshot or paste, reset it in the developer portal immediately.
+
+## 5. Commands
+
+| Command | Does |
+|---|---|
+| `/status` | current incidents and telemetry adapter health |
+| `/incidents` | recent incidents |
+| `/incident <id>` | one incident: diagnosis, evidence, timeline |
+| `/diagnose <id>` | investigate now |
+| `/discover` | inventory the configured hosts |
+| `/settings` | active LLM provider and adapters |
+| `/ask <question>` | ask in natural language |
+| `@OpsLoop ...` | same, conversationally (needs the message-content intent) |
+
+Approvals are **buttons on the incident card**, not typed commands. That is a
+security property, not a UI preference — see below.
+
+## Why Discord is fine here (and where it is not)
+
+**Fine:** buttons carry `interaction.user.id`, an identity Discord
+authenticates. Nothing typed in a message can forge one. Buttons are removed
+once a decision is taken, so a card cannot be clicked twice against a system
+that has since moved on. Threads keep an incident together. Embeds render the
+same `Card` objects every other surface renders.
+
+**Not fine, and worth stating plainly:** Discord is not an enterprise
+incident-response surface. No SRE team runs production approvals there. It
+ships first because it needs no tenant, no app registration and no admin
+approval — not because it is the right production choice.
+
+The architecture is what carries the claim instead: `ChatSurface` in
+[`chat/base.py`](../agent-core/src/opsloop/chat/base.py) is the same kind of
+boundary as the telemetry adapters and the LLM providers. Discord ships,
+console ships, and Teams is a third implementation of a settled interface
+rather than a rewrite.
+
+**The framing that holds up:**
+
+> Neutral on three axes — telemetry, model, and chat surface. Discord is what
+> ships and what gets demonstrated. Teams is a third implementation of an
+> interface that already has two.
+
+That is a stronger architectural position than picking one vendor, and it can
+be demonstrated today.
+
+## Adding Teams later
+
+Implement `ChatSurface` — `start`, `stop`, `post`, `update` — mapping `Card` to
+an Adaptive Card and the AAD object id to `ChatUser.id`. No incident logic,
+policy code, or model code changes. `chat/console.py` is ~130 lines and is the
+reference for how small a surface should be.

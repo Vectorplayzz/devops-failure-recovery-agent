@@ -1,0 +1,173 @@
+name: opsloop-demo
+
+# The "production" environment the agent monitors.
+#
+# Two choices here matter for the demo and are worth defending:
+#
+#   1. orders-api uses `restart: "no"` and a hard 256MB limit. When the memory
+#      leak triggers the kernel OOM killer the container STAYS DOWN, so
+#      `docker inspect` reports State.OOMKilled=true. With Docker's usual
+#      auto-restart the evidence is erased within a second and the agent is
+#      left diagnosing a service that looks healthy.
+#
+#   2. Postgres runs with max_connections=20. The default of 100 makes the
+#      pool-exhaustion scenario take minutes; 20 makes it land in seconds
+#      while producing the identical error a real system produces.
+#
+# Observability (Loki/Promtail/Prometheus/Grafana) is behind a profile so the
+# core stack runs in ~350MB on a small VPS:
+#     docker compose up -d                          # core only
+#     docker compose --profile observability up -d  # everything
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: demo-postgres
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+      POSTGRES_DB: orders
+    command: >
+      postgres
+        -c max_connections=20
+        -c log_connections=on
+        -c log_disconnections=on
+        -c log_min_duration_statement=500
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 256m
+    labels:
+      opsloop.role: datastore
+      opsloop.environment: production
+    networks: [demo]
+
+  payments-api:
+    build: ./services/payments-api
+    container_name: demo-payments-api
+    environment:
+      APP_VERSION: "2.0.1"
+    ports:
+      - "18082:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=2).status==200 else 1)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    mem_limit: 192m
+    restart: unless-stopped
+    labels:
+      opsloop.role: service
+      opsloop.environment: production
+      opsloop.tier: dependency
+    networks: [demo]
+
+  orders-api:
+    build: ./services/orders-api
+    container_name: demo-orders-api
+    environment:
+      APP_VERSION: "1.4.2"
+      PAYMENTS_URL: "http://payments-api:8080"
+      DB_DSN: "postgresql://orders:orders@postgres:5432/orders?connect_timeout=3"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "18081:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=2).status==200 else 1)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    # Tight limit so the leak reaches OOM in ~20 requests rather than ~2000.
+    mem_limit: 256m
+    memswap_limit: 256m
+    # Deliberately NOT restarting - see the header comment.
+    restart: "no"
+    labels:
+      opsloop.role: service
+      opsloop.environment: production
+      opsloop.tier: frontend
+      opsloop.slo.p99_ms: "2000"
+    networks: [demo]
+
+  loadgen:
+    build: ./services/loadgen
+    container_name: demo-loadgen
+    environment:
+      TARGET_URL: "http://orders-api:8080"
+      RPS: "2"
+    depends_on: [orders-api]
+    mem_limit: 128m
+    restart: unless-stopped
+    labels:
+      opsloop.role: loadgen
+      opsloop.environment: production
+    networks: [demo]
+
+  # ---------------------------------------------------------------------
+  # Observability - optional profile
+  # ---------------------------------------------------------------------
+
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: demo-loki
+    profiles: [observability]
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./observability/loki-config.yml:/etc/loki/loki-config.yml:ro
+    ports:
+      - "13100:3100"
+    mem_limit: 384m
+    networks: [demo]
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    container_name: demo-promtail
+    profiles: [observability]
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./observability/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on: [loki]
+    mem_limit: 192m
+    networks: [demo]
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: demo-prometheus
+    profiles: [observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "19090:9090"
+    mem_limit: 384m
+    networks: [demo]
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: demo-grafana
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "13000:3000"
+    depends_on: [loki, prometheus]
+    mem_limit: 256m
+    networks: [demo]
+
+networks:
+  demo:
+    name: opsloop-demo

@@ -1,0 +1,11 @@
+# Normalise to LF in the repository. These files are consumed by Linux
+# containers and by an Ubuntu VPS, where a CRLF line ending in a shell script
+# or entrypoint produces a "bad interpreter: no such file or directory" that is
+# very hard to read from the error alone.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+*.pptx binary
+*.docx binary

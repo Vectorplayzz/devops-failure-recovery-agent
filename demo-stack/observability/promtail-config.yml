@@ -1,0 +1,61 @@
+# Ships Docker container logs into Loki, labelled by the opsloop.* labels the
+# compose file sets. Those labels are what let the agent ask "give me the logs
+# for the frontend service in production" without hard-coding container names.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 10s
+        filters:
+          - name: label
+            values: ["opsloop.environment"]
+
+    relabel_configs:
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container
+
+      - source_labels: ["__meta_docker_container_label_opsloop_role"]
+        target_label: role
+
+      - source_labels: ["__meta_docker_container_label_opsloop_environment"]
+        target_label: environment
+
+      - source_labels: ["__meta_docker_container_label_opsloop_tier"]
+        target_label: tier
+
+      - source_labels: ["__meta_docker_container_log_stream"]
+        target_label: stream
+
+    pipeline_stages:
+      # The apps emit one JSON object per line; lifting fields into labels and
+      # using the app's own timestamp keeps ordering correct when a container
+      # is restarted mid-incident.
+      - json:
+          expressions:
+            level: level
+            service: service
+            version: version
+            msg: msg
+            ts: ts
+      - labels:
+          level:
+          service:
+          version:
+      - timestamp:
+          source: ts
+          format: RFC3339Nano
+          action_on_failure: fudge
+      - output:
+          source: msg
