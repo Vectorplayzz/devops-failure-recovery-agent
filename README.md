@@ -124,11 +124,13 @@ redacted before anything leaves the machine.
 | Chat surface protocol (`ChatSurface`, `Card`) | ✅ done |
 | Discord surface (slash commands + button approvals) | ✅ done |
 | Console surface | ✅ done |
+| Runtime: monitor → triage → approve → execute → verify | ✅ done — `python -m opsloop` |
+| Rule-based triage (grounded, abstains when unsure) | ✅ done |
 | Agent reasoning loop (LLM ↔ tools) | ⬜ next |
 | Settings UI | ⬜ next |
 | Teams surface | ⬜ optional — a third implementation of a settled interface |
 
-**98 tests passing** in 2.8s, plus an end-to-end proof against the live stack.
+**126 tests passing** in ~6.5s, plus an end-to-end proof against the live stack.
 
 ## The closed loop, proven
 

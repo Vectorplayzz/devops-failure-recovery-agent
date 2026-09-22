@@ -16,6 +16,7 @@ import pytest
 
 from opsloop.chat.base import (
     ApprovalEvent,
+    ApprovalOutcome,
     Card,
     ChatUser,
     Field,
@@ -293,9 +294,9 @@ class TestConsoleRendering:
     async def test_console_approval_carries_an_identity(self) -> None:
         captured: list[ApprovalEvent] = []
 
-        async def handler(event: ApprovalEvent) -> str:
+        async def handler(event: ApprovalEvent) -> ApprovalOutcome:
             captured.append(event)
-            return "recorded"
+            return ApprovalOutcome("recorded", retire_card=True, label="APPROVED")
 
         surface = ConsoleSurface(auto_approve=True)
         surface.on_approval(handler)

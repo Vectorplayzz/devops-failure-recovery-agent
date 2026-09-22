@@ -66,9 +66,39 @@ screenshot or paste, reset it in the developer portal immediately.
 | `/settings` | active LLM provider and adapters |
 | `/ask <question>` | ask in natural language |
 | `@OpsLoop ...` | same, conversationally (needs the message-content intent) |
+| `/inject <scenario>` | demo only: break the demo stack on purpose |
+| `/clear` | demo only: remove every injected fault and close open incidents |
 
 Approvals are **buttons on the incident card**, not typed commands. That is a
 security property, not a UI preference — see below.
+
+**Who can approve.** Only members with `OPSLOOP_DISCORD_ADMIN_ROLE`, or server
+administrators when it is unset. Being able to read the incident channel is not
+the same as being allowed to change production, so anyone else who clicks
+Approve gets a refusal and nothing runs. `/inject` and `/clear` follow the same
+rule.
+
+## 6. Run it
+
+```bash
+cd agent-core
+.venv/Scripts/python.exe -m opsloop
+```
+
+It posts **"OpsLoop is online"** with a status card to your channel, then
+scans every 15 seconds. With `OPSLOOP_DEMO_ENABLED=true` and the demo stack up
+(`docker compose up -d` in `demo-stack/`), try:
+
+```
+/inject scenario:oom
+```
+
+Within about half a minute an incident card appears with two approval cards:
+**Restart** (LOW risk, and it says plainly it will not fix a leak) and **Ship
+the corrected build** (MEDIUM). Approve the restart first to watch verification
+catch the relapse and roll it back; then approve the real fix and watch it hold.
+
+With no `OPSLOOP_DISCORD_TOKEN` set, the same agent runs in the terminal.
 
 ## Why Discord is fine here (and where it is not)
 

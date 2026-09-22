@@ -37,6 +37,7 @@ worse must be undone in seconds, not after a five-minute window elapses.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import json
 import logging
 import re
@@ -59,9 +60,23 @@ from ..domain.models import (
     _now,
 )
 from ..remediate.executors import ExecutorRegistry
-from ..telemetry.base import AdapterRegistry, LogQuery, TimeRange
+from ..telemetry.base import AdapterRegistry, LogQuery, TimeRange, utcnow
 
 log = logging.getLogger("opsloop.verify")
+
+def _bounded_range(window_minutes: int, not_before: datetime | None) -> TimeRange:
+    """The last `window_minutes`, but never earlier than `not_before`.
+
+    Without the bound, a log check run straight after a fix reads the errors
+    that caused the incident - still inside the window - and fails a fix that
+    worked. That would roll back correct remediations for every failure that
+    logs at ERROR level.
+    """
+    tr = TimeRange.last(window_minutes)
+    if not_before is not None and not_before > tr.start:
+        tr = TimeRange(start=not_before, end=utcnow())
+    return tr
+
 
 _OPERATORS = {
     "lt": lambda a, b: a < b,
@@ -78,6 +93,10 @@ class CheckContext:
     adapters: AdapterRegistry
     http: httpx.AsyncClient
     timeout: float = 10.0
+    #: Ignore telemetry older than this. Set to the moment verification began,
+    #: so evidence of the failure that was just fixed cannot fail the check
+    #: that is meant to confirm the fix.
+    not_before: datetime | None = None
 
 
 # --------------------------------------------------------------------------
@@ -209,7 +228,7 @@ async def _check_log_absence(check: HealthCheck, ctx: CheckContext) -> CheckOutc
             evidence = await adapter.fetch_logs(
                 LogQuery(
                     target=p.get("target", ""),
-                    time_range=TimeRange.last(window_minutes),
+                    time_range=_bounded_range(window_minutes, ctx.not_before),
                     limit=int(p.get("limit", 300)),
                 )
             )
@@ -370,8 +389,10 @@ class Verifier:
 
     # -- one round ---------------------------------------------------------
 
-    async def run_checks(self, plan: VerificationPlan) -> PollRound:
-        ctx = CheckContext(adapters=self.adapters, http=self._http)
+    async def run_checks(
+        self, plan: VerificationPlan, *, not_before: datetime | None = None
+    ) -> PollRound:
+        ctx = CheckContext(adapters=self.adapters, http=self._http, not_before=not_before)
         round_ = PollRound(at=time.time())
 
         async def run_one(check: HealthCheck) -> CheckOutcome:
@@ -442,6 +463,7 @@ class Verifier:
             return report
 
         passed_at_baseline = set(plan.baseline.get("passing_at_baseline", []))
+        verification_began = utcnow()
         deadline = time.time() + plan.window_seconds
         rounds: list[PollRound] = []
         first_green_index: int | None = None
@@ -450,7 +472,7 @@ class Verifier:
         while time.time() < deadline:
             if plan.max_polls is not None and len(rounds) >= plan.max_polls:
                 break
-            round_ = await self.run_checks(plan)
+            round_ = await self.run_checks(plan, not_before=verification_began)
             rounds.append(round_)
             report.outcomes.extend(round_.outcomes)
 
@@ -717,12 +739,6 @@ def plan_for_container_service(
             success_criteria="Container status is 'running', OOMKilled is false, restarts <= 3",
         ),
         HealthCheck(
-            name=f"{container} health endpoint returns 200",
-            kind="http",
-            params={"url": health_url, "expect_status": 200, "max_latency_ms": 3000},
-            success_criteria=f"GET {health_url} returns 200 within 3000ms",
-        ),
-        HealthCheck(
             name=f"No errors in {container} logs",
             kind="log_absence",
             params={
@@ -735,6 +751,19 @@ def plan_for_container_service(
             success_criteria="Zero error-level log lines in the last 2 minutes",
         ),
     ]
+
+    # A service with no known endpoint still gets process and log checks; an
+    # HTTP check against a guessed URL would fail forever and read as a relapse.
+    if health_url:
+        checks.insert(
+            1,
+            HealthCheck(
+                name=f"{container} health endpoint returns 200",
+                kind="http",
+                params={"url": health_url, "expect_status": 200, "max_latency_ms": 3000},
+                success_criteria=f"GET {health_url} returns 200 within 3000ms",
+            ),
+        )
 
     if prometheus_url and latency_query:
         checks.append(

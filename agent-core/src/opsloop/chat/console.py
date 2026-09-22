@@ -94,7 +94,7 @@ class ConsoleSurface(ChatSurface):
             if approve is not None:
                 decision = self.auto_approve or await self._prompt()
                 verb, incident_id, action_id = approve.action_id.split(":", 2)
-                summary = await self._on_approval(
+                outcome = await self._on_approval(
                     ApprovalEvent(
                         incident_id=incident_id,
                         action_id=action_id,
@@ -103,11 +103,9 @@ class ConsoleSurface(ChatSurface):
                         surface=self.name,
                     )
                 )
-                print(
-                    f"  -> {'APPROVED' if decision else 'REJECTED'}: {summary}",
-                    file=self.stream,
-                    flush=True,
-                )
+                label = outcome.label or ("APPROVED" if decision else "REJECTED")
+                shown = label if outcome.retire_card else "NOT ACCEPTED (card stays live)"
+                print(f"  -> {shown}: {outcome.message}", file=self.stream, flush=True)
 
         return MessageRef(
             surface=self.name, channel_id="console", message_id=str(next(self._ids))

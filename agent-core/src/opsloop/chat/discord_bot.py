@@ -27,6 +27,7 @@ from typing import Any
 
 from .base import (
     ApprovalEvent,
+    ApprovalOutcome,
     Button,
     ButtonStyle,
     Card,
@@ -142,6 +143,7 @@ class DiscordSurface(ChatSurface):
         guild_id: int | str = 0,
         admin_role: str = "",
         enable_message_chat: bool = True,
+        scenario_choices: list[str] | None = None,
     ) -> None:
         super().__init__()
         if discord is None:
@@ -153,6 +155,7 @@ class DiscordSurface(ChatSurface):
         self.guild_id = int(guild_id or 0)
         self.admin_role = admin_role
         self.enable_message_chat = enable_message_chat
+        self.scenario_choices = list(scenario_choices or [])
 
         intents = discord.Intents.default()
         # message_content is a PRIVILEGED intent. Without it the bot receives
@@ -239,6 +242,24 @@ class DiscordSurface(ChatSurface):
         async def _diagnose(interaction: Any, incident_id: str) -> None:  # pragma: no cover
             await self._handle_command(interaction, "diagnose", {"incident_id": incident_id})
 
+        if self.scenario_choices:
+            # Demo-only commands, registered only when the app supplies
+            # scenario names - the surface itself knows nothing about them.
+            simple("clear", "Demo: clear every injected fault and restore health")
+
+            @self.tree.command(name="inject", description="Demo: break production on purpose")
+            @app_commands.describe(scenario="Which failure to inject")
+            async def _inject(interaction: Any, scenario: str) -> None:  # pragma: no cover
+                await self._handle_command(interaction, "inject", {"scenario": scenario})
+
+            @_inject.autocomplete("scenario")
+            async def _inject_choices(interaction: Any, current: str) -> list[Any]:  # pragma: no cover
+                return [
+                    app_commands.Choice(name=s, value=s)
+                    for s in self.scenario_choices
+                    if current.lower() in s.lower()
+                ][:25]
+
         @self.tree.command(name="ask", description="Ask the agent about production")
         @app_commands.describe(question="What do you want to know?")
         async def _ask(interaction: Any, question: str) -> None:  # pragma: no cover
@@ -260,9 +281,45 @@ class DiscordSurface(ChatSurface):
                 reply = f"Something went wrong: `{exc}`"
             await self._send_followup(interaction, reply)
 
-    async def start(self) -> None:
+    async def start(self, *, timeout: float = 60.0) -> None:
+        """Connect, and fail loudly if Discord refuses.
+
+        Waiting on the ready event alone is a trap: if the gateway rejects the
+        connection - a bad token, or the MESSAGE CONTENT intent requested but
+        not enabled in the developer portal - the connect task dies, the event
+        is never set, and startup hangs forever with no error. Racing the two
+        turns that into an immediate, readable failure.
+        """
         self._task = asyncio.create_task(self.client.start(self.token))
-        await self._ready.wait()
+        ready = asyncio.create_task(self._ready.wait())
+        done, _ = await asyncio.wait(
+            {self._task, ready}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if ready in done:
+            return
+
+        ready.cancel()
+        # Release the HTTP session before raising, or the process exits with
+        # an "Unclosed client session" error stacked on top of the real one.
+        await self.client.close()
+        if self._task in done:
+            exc = self._task.exception()
+            if isinstance(exc, discord.PrivilegedIntentsRequired):
+                raise RuntimeError(
+                    "Discord refused the MESSAGE CONTENT intent. Enable it at "
+                    "https://discord.com/developers/applications -> your app -> Bot "
+                    "-> Privileged Gateway Intents, or set "
+                    "OPSLOOP_DISCORD_MESSAGE_CHAT=false to run with slash commands only."
+                ) from exc
+            if isinstance(exc, discord.LoginFailure):
+                raise RuntimeError(
+                    "Discord rejected the bot token. Reset it in the developer portal "
+                    "and update OPSLOOP_DISCORD_TOKEN."
+                ) from exc
+            raise RuntimeError(f"Discord connection failed: {exc!r}") from exc
+
+        raise TimeoutError(f"Discord did not become ready within {timeout:.0f}s")
 
     async def stop(self) -> None:
         await self.client.close()
@@ -316,26 +373,41 @@ class DiscordSurface(ChatSurface):
             surface=self.name,
         )
         try:
-            summary = await self._on_approval(event)
+            outcome = await self._on_approval(event)
         except Exception as exc:  # noqa: BLE001
             log.exception("approval handler failed")
-            summary = f"The approval could not be processed: `{exc}`"
+            # An internal error is not a decision. Keep the card live.
+            outcome = ApprovalOutcome(
+                message=f"The approval could not be processed: `{exc}`", retire_card=False
+            )
 
-        # Retire the buttons so the decision cannot be replayed later against a
-        # system that has since changed.
-        decision = "APPROVED" if event.approved else "REJECTED"
+        if not outcome.retire_card:
+            # A transient refusal - fix already in flight, clicker not an
+            # approver. Tell only the person who clicked, and leave the buttons
+            # for whoever should press them, when they should.
+            try:
+                await interaction.followup.send(
+                    truncate(outcome.message, MAX_CONTENT), ephemeral=True
+                )
+            except discord.HTTPException:
+                log.exception("could not send approval refusal")
+            return
+
+        # A recorded decision, or a card that can never work again: retire the
+        # buttons so it cannot be replayed against a system that has moved on.
+        label = outcome.label or ("APPROVED" if event.approved else "REJECTED")
         try:
             embed = interaction.message.embeds[0] if interaction.message.embeds else None
             if embed is not None:
                 embed.add_field(
-                    name=f"Decision: {decision}",
+                    name=f"Decision: {label}",
                     value=truncate(
-                        f"by {event.user.display_name} · {summary}", MAX_FIELD_VALUE
+                        f"by {event.user.display_name} - {outcome.message}", MAX_FIELD_VALUE
                     ),
                     inline=False,
                 )
                 embed.colour = _TONE_COLOUR[
-                    Tone.INFO if event.approved else Tone.NEUTRAL
+                    Tone.INFO if label == "APPROVED" else Tone.NEUTRAL
                 ]
                 await interaction.message.edit(embed=embed, view=None)
             else:

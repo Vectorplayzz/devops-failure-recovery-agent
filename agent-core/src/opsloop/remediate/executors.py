@@ -342,7 +342,7 @@ def register_ssh_executors(registry: ExecutorRegistry, adapter: Any, prefix: str
 # --------------------------------------------------------------------------
 
 
-def register_demo_executors(registry: ExecutorRegistry) -> None:
+def register_demo_executors(registry: ExecutorRegistry, client: Any = None) -> None:
     """Stands in for a code-level fix in the demo environment.
 
     In a real system the fix for a memory leak is shipping a patched build.
@@ -354,48 +354,127 @@ def register_demo_executors(registry: ExecutorRegistry) -> None:
     disguised as a generic executor, because anyone reading a demo is entitled
     to know which parts are real - the OOM kill is real, and this is the
     stand-in.
+
+    Why the fix goes through Postgres
+    ---------------------------------
+    orders-api persists its fault in the `fault_state` table so that a restart
+    does not cure it. That same property means its own admin endpoint is
+    useless in the case that matters most: after an OOM kill the process is
+    dead and nothing is listening. So the fix is written to the database first
+    - the equivalent of the corrected build being what starts next - and the
+    container is started if it is down. An approval button has to work on a
+    dead service, because a dead service is when someone presses it.
     """
     import httpx
+
+    if docker is None:
+        raise ExecutorError("the 'docker' package is not installed")
+    client = client or docker.from_env()
 
     ENDPOINTS = {
         "orders-api": "http://localhost:18081",
         "payments-api": "http://localhost:18082",
     }
+    CONTAINERS = {"orders-api": "demo-orders-api", "payments-api": "demo-payments-api"}
+    PERSISTED = {"orders-api"}  # fault stored in Postgres; survives restarts
+    POSTGRES = "demo-postgres"
+    # Modes are interpolated into SQL, so they come from this closed set only.
+    VALID_MODES = {
+        "none", "memleak", "pool_exhaust", "dep_fail", "latency", "error500",
+        "log_injection", "slow", "down", "flaky",
+    }
 
-    async def clear_fault(params: dict[str, Any]) -> tuple[bool, str, str]:
+    def _service(params: dict[str, Any]) -> str:
         service = params["service"]
-        base = ENDPOINTS.get(service)
-        if base is None:
+        if service not in ENDPOINTS:
             raise ExecutorError(
                 f"unknown demo service {service!r}; known: {', '.join(ENDPOINTS)}"
             )
-        async with httpx.AsyncClient(timeout=10) as http:
-            r = await http.post(f"{base}/admin/fault", json={"mode": "none", "intensity": 1.0})
-            r.raise_for_status()
-            body = r.json()
-        return True, f"{service}: fault {body.get('previous')} -> {body.get('mode')}", ""
+        return service
 
-    async def set_fault(params: dict[str, Any]) -> tuple[bool, str, str]:
-        service = params["service"]
-        mode = params["mode"]
-        base = ENDPOINTS.get(service)
-        if base is None:
-            raise ExecutorError(f"unknown demo service {service!r}")
+    def _persist(mode: str) -> None:
+        if mode not in VALID_MODES:
+            raise ExecutorError(f"refusing unknown fault mode {mode!r}")
+        pg = client.containers.get(POSTGRES)
+        result = pg.exec_run(
+            [
+                "psql", "-U", "orders", "-d", "orders", "-v", "ON_ERROR_STOP=1", "-c",
+                f"UPDATE fault_state SET mode='{mode}', intensity=1.0, "
+                f"updated_at=now() WHERE id=1",
+            ]
+        )
+        if result.exit_code != 0:
+            raise ExecutorError(
+                f"could not persist fault mode: {result.output.decode(errors='replace')[:200]}"
+            )
+
+    def _running(service: str) -> bool:
+        try:
+            c = client.containers.get(CONTAINERS[service])
+        except NotFound:
+            return False
+        return c.attrs.get("State", {}).get("Status") == "running"
+
+    async def _post_mode(service: str, mode: str) -> str:
         async with httpx.AsyncClient(timeout=10) as http:
-            r = await http.post(f"{base}/admin/fault", json={"mode": mode, "intensity": 1.0})
+            r = await http.post(
+                f"{ENDPOINTS[service]}/admin/fault", json={"mode": mode, "intensity": 1.0}
+            )
             r.raise_for_status()
             body = r.json()
-        return True, f"{service}: fault {body.get('previous')} -> {body.get('mode')}", ""
+        return f"fault {body.get('previous')} -> {body.get('mode')}"
+
+    async def _wait_healthy(service: str, seconds: int = 45) -> bool:
+        async with httpx.AsyncClient(timeout=3) as http:
+            for _ in range(seconds):
+                try:
+                    if (await http.get(f"{ENDPOINTS[service]}/health")).status_code == 200:
+                        return True
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(1)
+        return False
+
+    async def apply_fix(params: dict[str, Any]) -> tuple[bool, str, str]:
+        service = _service(params)
+        steps: list[str] = []
+
+        if service in PERSISTED:
+            await asyncio.to_thread(_persist, "none")
+            steps.append("corrected build recorded (fault_state=none)")
+
+        if _running(service):
+            # Live process: also release what it already leaked.
+            steps.append(await _post_mode(service, "none"))
+        else:
+            await asyncio.to_thread(lambda: client.containers.get(CONTAINERS[service]).start())
+            steps.append(f"{CONTAINERS[service]} was down; started on the corrected build")
+            if not await _wait_healthy(service):
+                return False, "; ".join(steps), f"{service} did not become healthy"
+            steps.append("healthy")
+
+        return True, f"{service}: " + "; ".join(steps), ""
+
+    async def revert_fix(params: dict[str, Any]) -> tuple[bool, str, str]:
+        service = _service(params)
+        mode = params["mode"]
+        steps: list[str] = []
+        if service in PERSISTED:
+            await asyncio.to_thread(_persist, mode)
+            steps.append(f"fault_state={mode}")
+        if _running(service):
+            steps.append(await _post_mode(service, mode))
+        return True, f"{service}: " + "; ".join(steps), ""
 
     registry.register(
         ExecutorSpec(
             id="demo.apply_code_fix",
             description=(
                 "Apply the corrected build for a demo service (stops the leak / "
-                "removes the defect at source)."
+                "removes the defect at source), starting it if it is down."
             ),
             risk=RiskLevel.MEDIUM,
-            handler=clear_fault,
+            handler=apply_fix,
             required_params=("service",),
             reversal="demo.revert_code_fix re-introduces the defect.",
         )
@@ -405,7 +484,7 @@ def register_demo_executors(registry: ExecutorRegistry) -> None:
             id="demo.revert_code_fix",
             description="Re-introduce a defect in a demo service (rollback path).",
             risk=RiskLevel.MEDIUM,
-            handler=set_fault,
+            handler=revert_fix,
             required_params=("service", "mode"),
             reversal="demo.apply_code_fix removes it again.",
         )

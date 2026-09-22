@@ -45,7 +45,7 @@ class ScriptedVerifier(Verifier):
         self.script = list(script)
         self.calls = 0
 
-    async def run_checks(self, plan: VerificationPlan) -> PollRound:
+    async def run_checks(self, plan: VerificationPlan, **_: Any) -> PollRound:
         index = min(self.calls, len(self.script) - 1)
         step = self.script[index]
         self.calls += 1
@@ -204,6 +204,48 @@ class TestRollback:
         inc = Incident(title="t")
         await v.verify_and_maybe_rollback(inc, self._action(), plan())
         assert any(e.event == "verification_warning" for e in inc.timeline)
+        await v.close()
+
+
+class TestPostFixLogWindow:
+    """Regression: log checks must not read the errors the fix just cured.
+
+    Before this, `log_absence` scanned the last two minutes of logs. Straight
+    after a correct fix those minutes still hold the errors that opened the
+    incident, so the check failed, verification reported NOT_RECOVERED, and a
+    working fix was rolled back. Every failure that logs at ERROR level was
+    affected; only the OOM scenario escaped, because its leak logs WARNING.
+    """
+
+    def test_window_is_clamped_to_verification_start(self) -> None:
+        from datetime import timedelta
+
+        from opsloop.telemetry.base import utcnow
+        from opsloop.verify.loop import _bounded_range
+
+        began = utcnow() - timedelta(seconds=20)
+        tr = _bounded_range(2, began)
+        assert tr.start == began  # not two minutes ago
+
+    def test_unbounded_when_no_start_is_given(self) -> None:
+        """Baselines are taken before the fix and want the full window."""
+        from opsloop.verify.loop import _bounded_range
+
+        tr = _bounded_range(2, None)
+        assert 110 <= tr.duration_seconds <= 130
+
+    async def test_verify_passes_its_start_time_to_every_poll(self) -> None:
+        seen: list[Any] = []
+
+        class Recording(ScriptedVerifier):
+            async def run_checks(self, plan: VerificationPlan, **kw: Any) -> PollRound:
+                seen.append(kw.get("not_before"))
+                return await super().run_checks(plan)
+
+        v = Recording([True])
+        await v.verify(plan(max_polls=3))
+        assert len(seen) == 3 and all(x is not None for x in seen)
+        assert len(set(seen)) == 1  # one fixed start, not a sliding one
         await v.close()
 
 

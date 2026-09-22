@@ -148,7 +148,25 @@ class ChatQuestion:
     incident_id: str = ""  # set when asked inside an incident thread
 
 
-ApprovalHandler = Callable[[ApprovalEvent], Awaitable[str]]
+@dataclass
+class ApprovalOutcome:
+    """What the agent made of a click, and what the card should do about it.
+
+    `retire_card` is the important field. A surface must NOT assume a click was
+    accepted: a refusal because another fix is in flight, or because the
+    clicker is not an approver, is transient - the card has to stay clickable
+    for the right person at the right time. Retiring it anyway strands the
+    incident with no way to approve the fix it needs. Only a recorded decision
+    or a card that can never work again (incident resolved, action already
+    decided, card from a previous run) is retired.
+    """
+
+    message: str
+    retire_card: bool
+    label: str = ""  # shown on a retired card, e.g. "APPROVED"
+
+
+ApprovalHandler = Callable[[ApprovalEvent], Awaitable[ApprovalOutcome]]
 CommandHandler = Callable[[ChatCommand], Awaitable[Card | str]]
 QuestionHandler = Callable[[ChatQuestion], Awaitable[Card | str]]
 
