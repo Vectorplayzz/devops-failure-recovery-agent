@@ -199,6 +199,10 @@ class SSHAdapter(TelemetryAdapter):
         self.config = config
         self._client: Any = None
         self._lock = asyncio.Lock()
+        # Circuit breaker. See _ensure_connected.
+        self._failures = 0
+        self._retry_after = 0.0
+        self._last_error = ""
 
     @property
     def supports_inventory(self) -> bool:
@@ -233,32 +237,86 @@ class SSHAdapter(TelemetryAdapter):
         client.connect(**kwargs)
         return client
 
+    BACKOFF_BASE_SECONDS = 15
+    BACKOFF_MAX_SECONDS = 600
+
     async def _ensure_connected(self) -> Any:
+        """Connect once, and back off hard when that fails.
+
+        A monitor that retries a failing login on every probe and every scan
+        is indistinguishable from a brute-force attack. fail2ban's default
+        bans an address after 5 failures in 10 minutes - so an agent without
+        this breaker would lock its owner out of their own server, and keep
+        them locked out. After a failure no new attempt is made until the
+        backoff expires (15s, doubling to a 10 minute ceiling); callers get
+        the last error instantly instead.
+        """
         async with self._lock:
             if self._client is not None:
                 transport = self._client.get_transport()
                 if transport is not None and transport.is_active():
                     return self._client
                 self._client = None
+
+            now = time.monotonic()
+            if now < self._retry_after:
+                raise AdapterError(
+                    self.name,
+                    f"not retrying SSH to {self.config.host} for another "
+                    f"{int(self._retry_after - now)}s after {self._failures} failure(s): "
+                    f"{self._last_error}",
+                )
             try:
                 self._client = await asyncio.to_thread(self._connect_sync)
             except Exception as exc:  # noqa: BLE001
+                self._failures += 1
+                self._last_error = str(exc) or exc.__class__.__name__
+                wait = min(
+                    self.BACKOFF_MAX_SECONDS,
+                    self.BACKOFF_BASE_SECONDS * 2 ** (self._failures - 1),
+                )
+                self._retry_after = time.monotonic() + wait
                 raise AdapterError(
-                    self.name, f"SSH connection to {self.config.host} failed: {exc}"
+                    self.name, f"SSH connection to {self.config.host} failed: {self._last_error}"
                 ) from exc
+            self._failures = 0
+            self._retry_after = 0.0
+            self._last_error = ""
             return self._client
 
-    def _run_sync(self, client: Any, command: str) -> CommandResult:
+    def _run_sync(self, client: Any, command: str, timeout: int | None = None) -> CommandResult:
         at = utcnow()
         _, stdout, stderr = client.exec_command(
-            command, timeout=self.config.command_timeout
+            command, timeout=timeout or self.config.command_timeout
         )
         out = stdout.read().decode("utf-8", errors="replace")
         err = stderr.read().decode("utf-8", errors="replace")
         code = stdout.channel.recv_exit_status()
         return CommandResult(command=command, exit_code=code, stdout=out, stderr=err, at=at)
 
-    async def run(self, command: str) -> CommandResult:
+    async def disk_usage(self, path: str = "/") -> EvidenceRef:
+        """What is using the space under `path`, largest first.
+
+        Read-only. `sudo -n` is tried first because an unprivileged `du` skips
+        every directory it cannot read and under-reports badly; `-n` means it
+        fails instantly instead of hanging on a password prompt, and plain
+        `du` is the fallback. `-x` keeps it on one filesystem, so a mounted
+        network share cannot turn this into an hour-long crawl.
+        """
+        if not path.startswith("/") or ".." in path.split("/"):
+            raise AdapterError(self.name, f"disk_usage needs an absolute path without '..': {path!r}")
+        q = shlex.quote(path)
+        du = f"du -xh --max-depth=1 {q} 2>/dev/null | sort -rh | head -15"
+        command = f"(sudo -n sh -c {shlex.quote(du)} 2>/dev/null || {du})"
+        result = await self.run(command, timeout=120)
+        return self.make_trusted_evidence(
+            raw=result.stdout or "(no output - path unreadable or empty)",
+            query=f"{self.config.username}@{self.config.host}: du -xh --max-depth=1 {path}",
+            observed_at=result.at,
+            path=path,
+        )
+
+    async def run(self, command: str, *, timeout: int | None = None) -> CommandResult:
         """Run one read-only command.
 
         Internal use only: every caller in this module passes a string it
@@ -267,7 +325,7 @@ class SSHAdapter(TelemetryAdapter):
         """
         client = await self._ensure_connected()
         try:
-            return await asyncio.to_thread(self._run_sync, client, command)
+            return await asyncio.to_thread(self._run_sync, client, command, timeout)
         except Exception as exc:  # noqa: BLE001
             raise AdapterError(self.name, f"command failed: {exc}") from exc
 
@@ -303,6 +361,15 @@ class SSHAdapter(TelemetryAdapter):
         and a partial inventory is far more useful than an exception.
         """
         inv = HostInventory()
+
+        # One connection attempt for the whole inventory. If it fails, stop:
+        # a dozen probes each retrying the login is what gets an address
+        # banned (see _ensure_connected).
+        try:
+            await self._ensure_connected()
+        except AdapterError as exc:
+            inv.errors.append(str(exc))
+            return inv
 
         async def probe(command: str, label: str) -> str:
             try:

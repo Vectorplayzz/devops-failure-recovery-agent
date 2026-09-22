@@ -132,6 +132,72 @@ class _CardButton(discord.ui.Button if discord else object):  # type: ignore[mis
         await self.surface._handle_button(interaction, self.spec.action_id)
 
 
+class _LlmModal(discord.ui.Modal if discord else object):  # type: ignore[misc]
+    """The LLM settings menu, as a private Discord form.
+
+    A modal rather than slash-command options, because option values are
+    shown to everyone in the channel and one of these fields is an API key.
+    What is typed here goes only to the bot. The current key is never sent
+    back to pre-fill the form - leave it blank to keep it.
+    """
+
+    def __init__(self, surface: DiscordSurface, defaults: dict[str, str]) -> None:
+        super().__init__(title="OpsLoop - LLM provider", timeout=600)
+        self.surface = surface
+        self.provider = discord.ui.TextInput(
+            label="Provider (preset name or any label)",
+            placeholder="groq, openai, anthropic, openrouter, ollama, custom...",
+            default=defaults.get("provider") or "groq",
+            max_length=40,
+        )
+        self.base_url = discord.ui.TextInput(
+            label="Base URL (blank = preset default)",
+            placeholder="https://your-endpoint/v1 - any OpenAI-compatible server",
+            default=defaults.get("base_url") or None,
+            required=False,
+            max_length=300,
+        )
+        self.api_key = discord.ui.TextInput(
+            label="API key (blank = keep the current one)",
+            required=False,
+            max_length=400,
+        )
+        self.model = discord.ui.TextInput(
+            label="Model (blank = preset default)",
+            placeholder="openai/gpt-oss-120b",
+            default=defaults.get("model") or None,
+            required=False,
+            max_length=120,
+        )
+        for item in (self.provider, self.base_url, self.api_key, self.model):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: Any) -> None:  # pragma: no cover - needs a live gateway
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if self.surface._on_command is None:
+            await interaction.followup.send("No handler configured.", ephemeral=True)
+            return
+        try:
+            result = await self.surface._on_command(
+                ChatCommand(
+                    name="llm_set",
+                    args={
+                        "provider": self.provider.value,
+                        "base_url": self.base_url.value,
+                        "api_key": self.api_key.value,
+                        "model": self.model.value,
+                    },
+                    user=self.surface._user_of(interaction.user),
+                    channel_id=str(interaction.channel_id),
+                    surface=self.surface.name,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("llm settings handler failed")
+            result = f"Settings could not be saved: `{exc}`"
+        await self.surface._send_followup(interaction, result, ephemeral=True)
+
+
 class DiscordSurface(ChatSurface):
     name = "discord"
 
@@ -156,6 +222,9 @@ class DiscordSurface(ChatSurface):
         self.admin_role = admin_role
         self.enable_message_chat = enable_message_chat
         self.scenario_choices = list(scenario_choices or [])
+        # Set by the agent: returns pre-fill values for a named form. The
+        # surface asks; it never knows what the values mean.
+        self.form_defaults: Any = None
 
         intents = discord.Intents.default()
         # message_content is a PRIVILEGED intent. Without it the bot receives
@@ -231,6 +300,17 @@ class DiscordSurface(ChatSurface):
         simple("incidents", "List recent incidents")
         simple("discover", "Inventory the configured hosts")
         simple("settings", "Show the active LLM provider and adapters")
+        simple("llm_test", "Test the connection to the active LLM provider")
+
+        @self.tree.command(name="llm", description="Choose the LLM provider and model (admins)")
+        async def _llm(interaction: Any) -> None:  # pragma: no cover
+            if not self._user_of(interaction.user).is_admin:
+                await interaction.response.send_message(
+                    "Only administrators can change the LLM provider.", ephemeral=True
+                )
+                return
+            defaults = self.form_defaults("llm") if callable(self.form_defaults) else {}
+            await interaction.response.send_modal(_LlmModal(self, defaults or {}))
 
         @self.tree.command(name="incident", description="Show one incident in detail")
         @app_commands.describe(incident_id="Incident id, e.g. inc_a1b2c3d4")
@@ -441,12 +521,16 @@ class DiscordSurface(ChatSurface):
 
     # -- outbound ----------------------------------------------------------
 
-    async def _send_followup(self, interaction: Any, result: Card | str) -> None:  # pragma: no cover
+    async def _send_followup(
+        self, interaction: Any, result: Card | str, *, ephemeral: bool = False
+    ) -> None:  # pragma: no cover
         if isinstance(result, Card):
-            view = CardView(self, result.buttons) if result.buttons else None
-            await interaction.followup.send(embed=card_to_embed(result), view=view)
+            kwargs: dict[str, Any] = {"embed": card_to_embed(result), "ephemeral": ephemeral}
+            if result.buttons:
+                kwargs["view"] = CardView(self, result.buttons)
+            await interaction.followup.send(**kwargs)
         else:
-            await interaction.followup.send(truncate(str(result), MAX_CONTENT))
+            await interaction.followup.send(truncate(str(result), MAX_CONTENT), ephemeral=ephemeral)
 
     async def _reply_to_message(self, message: Any, result: Card | str) -> None:  # pragma: no cover
         if isinstance(result, Card):

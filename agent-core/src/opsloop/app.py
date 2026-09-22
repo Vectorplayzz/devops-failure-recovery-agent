@@ -70,6 +70,12 @@ from .telemetry.base import AdapterRegistry, LogQuery, TimeRange, utcnow
 from .telemetry.docker_adapter import DockerAdapter
 from .triage.rules import MODEL_ID, RuleTriage, classify_log_burst, service_of
 from .verify.loop import Verifier, plan_for_container_service
+from .agent.reasoner import Reasoner, ReasonerError, format_answer
+from .agent.tools import ToolBox
+from .llm import settings_store
+from .llm.base import ProviderConfig
+from .llm.registry import PRESETS_BY_KEY, build_provider
+from .domain.models import Diagnosis, Hypothesis, Severity
 
 log = logging.getLogger("opsloop")
 
@@ -125,7 +131,12 @@ class Settings:
     verify_poll_seconds: int = 7
     verify_required_passes: int = 3
     autonomy: AutonomyMode = AutonomyMode.APPROVE_THEN_EXECUTE
-    llm_configured: bool = False
+    settings_file: str = "opsloop-settings.json"
+    ssh_host: str = ""
+    ssh_user: str = "root"
+    ssh_port: int = 22
+    ssh_key: str = ""
+    host_scan_every: int = 4  # scan the remote host every Nth monitor pass
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -142,7 +153,11 @@ class Settings:
             verify_window_seconds=int(e("OPSLOOP_VERIFY_WINDOW", "70")),
             verify_poll_seconds=int(e("OPSLOOP_VERIFY_POLL", "7")),
             verify_required_passes=int(e("OPSLOOP_VERIFY_PASSES", "3")),
-            llm_configured=bool(e("OPSLOOP_LLM_PROVIDER", "")),
+            settings_file=e("OPSLOOP_SETTINGS_FILE", "opsloop-settings.json"),
+            ssh_host=e("OPSLOOP_SSH_HOST", ""),
+            ssh_user=e("OPSLOOP_SSH_USER", "root"),
+            ssh_port=int(e("OPSLOOP_SSH_PORT", "22")),
+            ssh_key=os.path.expanduser(e("OPSLOOP_SSH_KEY", "")),
         )
 
 
@@ -176,6 +191,7 @@ class Agent:
         self.adapters = AdapterRegistry()
         self.adapters.add(self.docker)
 
+        self._own_executors = executors is None
         if executors is None:
             executors = ExecutorRegistry()
             register_docker_executors(executors)
@@ -189,12 +205,53 @@ class Agent:
         self.verifier = verifier or Verifier(self.adapters, self.executors)
         self.triage = RuleTriage(self.docker, demo_executors=settings.demo_enabled)
 
+        self.ssh: Any = None
+        if settings.ssh_host:
+            from .telemetry.ssh_adapter import SSHAdapter, SSHConfig
+
+            self.ssh = SSHAdapter(
+                "vps",
+                SSHConfig(
+                    host=settings.ssh_host,
+                    username=settings.ssh_user,
+                    port=settings.ssh_port,
+                    key_path=settings.ssh_key,
+                ),
+            )
+            self.adapters.add(self.ssh)
+            if self._own_executors:
+                from .remediate.executors import register_ssh_executors
+
+                register_ssh_executors(self.executors, self.ssh, prefix="vps")
+        self._scans = 0
+        self._ssh_warned = False
+
+        self.toolbox = ToolBox(
+            docker=self.docker,
+            store=self.store,
+            ssh=self.ssh,
+            service_endpoints=DEMO_ENDPOINTS if settings.demo_enabled else {},
+            executors=self.executors,
+        )
+        self.reasoner: Reasoner | None = None
+        self.llm_config: ProviderConfig | None = None
+        self.settings_path = Path(settings.settings_file)
+        try:
+            config = settings_store.load(self.settings_path)
+        except ValueError as exc:
+            log.warning("LLM settings ignored: %s", exc)
+            config = None
+        if config is not None:
+            self._install_llm(config)
+
         self._busy: set[str] = set()  # incidents with a remediation in flight
         self._approval_cards: dict[str, _Posted] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         self._monitor: asyncio.Task[Any] | None = None
 
         surface.on_command(self.handle_command)
+        if hasattr(surface, "form_defaults"):
+            surface.form_defaults = self._form_defaults  # type: ignore[attr-defined]
         surface.on_approval(self.handle_approval)
         surface.on_question(self.handle_question)
 
@@ -263,7 +320,117 @@ class Agent:
 
             if reasons:
                 opened.append(await self.open_incident(state.name, "; ".join(reasons)))
+
+        self._scans += 1
+        if self.ssh is not None and (self._scans - 1) % max(1, self.settings.host_scan_every) == 0:
+            host_incident = await self.scan_host()
+            if host_incident is not None:
+                opened.append(host_incident)
         return opened
+
+    # -- remote host ----------------------------------------------------------
+
+    @property
+    def host_service(self) -> str:
+        return f"host:{self.settings.ssh_host}"
+
+    async def scan_host(self) -> Incident | None:
+        """Watch the remote host for the failures a container view cannot see.
+
+        A full root filesystem, a failed systemd unit, exhausted memory - these
+        take down everything on the box at once, and none of them shows up as
+        a container exit code.
+        """
+        if self.store.open_for(self.host_service) is not None:
+            return None
+        inv = await self.ssh.discover()
+        if not inv.hostname and inv.errors:
+            if not self._ssh_warned:
+                log.warning("remote host unreachable: %s", "; ".join(inv.errors[:2]))
+                self._ssh_warned = True
+            return None
+        self._ssh_warned = False
+
+        reasons: list[str] = []
+        free = inv.root_disk_free_percent()
+        if free is not None and free <= 10:
+            reasons.append(f"root filesystem {100 - free}% full")
+        if inv.failed_units:
+            reasons.append("failed units: " + ", ".join(inv.failed_units[:5]))
+        if inv.memory_total_mb and inv.memory_available_mb < inv.memory_total_mb * 0.05:
+            reasons.append(f"only {inv.memory_available_mb}MB memory available")
+        if not reasons:
+            return None
+        return await self._open_host_incident(inv, reasons)
+
+    async def _open_host_incident(self, inv: Any, reasons: list[str]) -> Incident:
+        incident = Incident(
+            title=f"{inv.hostname or self.settings.ssh_host}: {'; '.join(reasons)}",
+            service=self.host_service,
+            environment="production",
+            state=IncidentState.TRIAGING,
+        )
+        incident.signals.append(Signal(
+            detector="host-monitor", title="; ".join(reasons), service=self.host_service,
+            raw={"failed_units": list(inv.failed_units)},
+        ))
+        self.store.add(incident)
+
+        ev = self.ssh.make_trusted_evidence(
+            raw=inv.summarise(),
+            query=f"opsloop discover {self.settings.ssh_user}@{self.settings.ssh_host}",
+        )
+        hypotheses: list[Hypothesis] = []
+        actions: list[ProposedAction] = []
+        free = inv.root_disk_free_percent()
+        if free is not None and free <= 10:
+            incident.severity = Severity.SEV1 if free <= 2 else Severity.SEV2
+            hypotheses.append(Hypothesis(
+                statement=f"The root filesystem is {100 - free}% full.",
+                mechanism=(
+                    "With no free space, databases fail writes, logs stop, package "
+                    "updates fail and services die on their next restart. Deleting "
+                    "files is not in the executor catalogue - a human must decide what "
+                    "is safe to remove. Ask me what is using the space."
+                ),
+                confidence=0.95,
+                evidence_ids=[ev.id],
+            ))
+        for unit in inv.failed_units[:3]:
+            incident.severity = min(incident.severity, Severity.SEV2, key=lambda x: x.value)
+            hypotheses.append(Hypothesis(
+                statement=f"systemd unit {unit} has failed.",
+                mechanism="The unit exited and systemd is not restarting it.",
+                confidence=0.85,
+                evidence_ids=[ev.id],
+            ))
+            if self._own_executors:
+                actions.append(ProposedAction(
+                    intent=f"Start {unit} on {inv.hostname or self.settings.ssh_host}",
+                    forward=ActionSpec(executor="vps.systemctl_start", params={"unit": unit}, target=unit),
+                    rollback=ActionSpec(executor="vps.systemctl_stop", params={"unit": unit}, target=unit),
+                    risk=self.executors.risk_of("vps.systemctl_start"),
+                    rationale="Brings the unit back. The cause of its failure is not yet known.",
+                    evidence_ids=[ev.id],
+                    expected_effect=f"{unit} is active.",
+                    blast_radius=f"{unit} on the remote host. Needs sudo rights for the SSH user.",
+                ))
+
+        incident.diagnosis = Diagnosis(
+            incident_id=incident.id, model_id=MODEL_ID, hypotheses=hypotheses,
+            evidence=[ev], tool_call_count=1,
+        )
+        incident.proposed_actions = actions
+        incident.state = IncidentState.AWAITING_APPROVAL if actions else IncidentState.ESCALATED
+        await self.surface.post(incident_card(incident))
+        for action in actions:
+            decision = self.policy.evaluate(action, incident=incident)
+            if decision.blocked:
+                continue
+            incident.log("agent", "approval_requested", action.intent, action_id=action.id)
+            ref = await self.surface.post(approval_card(incident, action, decision))
+            self._approval_cards[action.id] = _Posted(ref, incident.id, action)
+        return incident
 
     async def open_incident(self, container: str, reason: str) -> Incident:
         service = service_of(container)
@@ -283,6 +450,19 @@ class Agent:
 
     async def _triage(self, incident: Incident, container: str) -> None:
         result = await self.triage.investigate(incident, container)
+
+        # Rules first: instant, free, deterministic. The model is asked only
+        # when the rules abstain - and never for a security finding, where the
+        # correct output is already known: report it, propose nothing.
+        if result.diagnosis.abstained and self.reasoner is not None and not result.security_finding:
+            try:
+                llm = await self.reasoner.diagnose(incident, container)
+                result.diagnosis = llm.diagnosis
+                result.actions = llm.actions
+                if llm.rejected_actions:
+                    incident.log("agent", "llm_actions_rejected", "; ".join(llm.rejected_actions))
+            except ReasonerError as exc:
+                incident.log("agent", "llm_failed", str(exc))
         incident.diagnosis = result.diagnosis
         incident.title = result.title or incident.title
         incident.severity = result.severity
@@ -398,6 +578,27 @@ class Agent:
         )
 
     def _plan_for(self, incident: Incident) -> Any:
+        if incident.service.startswith("host:") and self.ssh is not None:
+            import shlex
+
+            from .domain.models import HealthCheck, VerificationPlan
+
+            units = [a.forward.params.get("unit", "") for a in incident.proposed_actions]
+            return VerificationPlan(
+                checks=[
+                    HealthCheck(
+                        name=f"{u} is active",
+                        kind="command",
+                        params={"adapter": "vps", "command": f"systemctl is-active {shlex.quote(u)}",
+                                "expect_exit_code": 0},
+                        success_criteria=f"systemctl is-active {u} exits 0",
+                    )
+                    for u in units if u
+                ],
+                window_seconds=self.settings.verify_window_seconds,
+                poll_interval_seconds=self.settings.verify_poll_seconds,
+                required_consecutive_passes=self.settings.verify_required_passes,
+            )
         container = (incident.signals[0].raw.get("container") if incident.signals else "") or (
             f"demo-{incident.service}"
         )
@@ -521,11 +722,105 @@ class Agent:
             return await self._discover_card()
         if name == "settings":
             return self._settings_card()
+        if name == "llm_set":
+            return await self.configure_llm(cmd)
+        if name == "llm_test":
+            return await self._llm_test()
         if name == "inject":
             return await self._inject(cmd.args.get("scenario", "").strip(), cmd)
         if name == "clear":
             return await self._clear(cmd)
         return f"Unknown command `/{name}`."
+
+    # -- LLM settings ----------------------------------------------------------
+
+    def _install_llm(self, config: ProviderConfig) -> None:
+        old = self.reasoner
+        self.reasoner = Reasoner(build_provider(config), self.toolbox, policy=self.policy)
+        self.llm_config = config
+        if old is not None:
+            try:
+                self._spawn(old.provider.close())
+            except RuntimeError:
+                pass  # no running loop (construction time); nothing to close yet
+        log.info("LLM provider: %s model=%s", config.display, config.model)
+
+    def _form_defaults(self, form: str) -> dict[str, str]:
+        """Pre-fill for the settings menu. The API key is never sent back out."""
+        c = self.llm_config
+        if form != "llm" or c is None:
+            return {"provider": "groq", "base_url": "", "model": ""}
+        return {"provider": c.id, "base_url": c.base_url, "model": c.model}
+
+    def _llm_summary(self) -> str:
+        c = self.llm_config
+        if c is None:
+            return f"{MODEL_ID}. No LLM configured - use `/llm`."
+        key = c.api_key.get_secret_value()
+        masked = f"...{key[-4:]}" if len(key) >= 8 else ("set" if key else "none")
+        return f"**{c.display}** `{c.model}`\n{c.base_url} (key {masked})"
+
+    async def configure_llm(self, cmd: ChatCommand) -> Card | str:
+        """The settings menu's save button: build, TEST, and only then switch.
+
+        A provider that fails its connection test never replaces a working one,
+        so a typo in the menu cannot silently cut the agent's reasoning off.
+        """
+        if not cmd.user.is_admin:
+            return "Only administrators can change the LLM provider."
+        a = {k: str(v or "").strip() for k, v in cmd.args.items()}
+        api_key = a.get("api_key", "")
+        if not api_key and self.llm_config is not None and a.get("provider", "").lower() == self.llm_config.id:
+            api_key = self.llm_config.api_key.get_secret_value()  # blank = keep current
+        try:
+            config = settings_store.config_from_values(
+                provider=a.get("provider", ""),
+                base_url=a.get("base_url", ""),
+                api_key=api_key,
+                model=a.get("model", ""),
+            )
+        except ValueError as exc:
+            return f"Not saved: {exc}"
+
+        provider = build_provider(config)
+        try:
+            test = await provider.test_connection()
+        finally:
+            await provider.close()
+        if not test.ok:
+            return Card(
+                title="LLM not changed - connection test failed",
+                body=truncate(test.error, 1500),
+                fields=[Field("Still active", self._llm_summary())],
+                tone=Tone.CRITICAL,
+            )
+
+        self._install_llm(config)
+        settings_store.save(self.settings_path, config)
+        return Card(
+            title="LLM provider updated",
+            fields=[
+                Field("Now using", self._llm_summary()),
+                Field("Connection test", f"ok in {test.latency_ms}ms - {truncate(test.detail, 200)}"),
+            ],
+            tone=Tone.SUCCESS,
+            footer="saved; survives restarts",
+        )
+
+    async def _llm_test(self) -> Card | str:
+        if self.reasoner is None:
+            return "No LLM configured. Use `/llm` to add one."
+        test = await self.reasoner.provider.test_connection()
+        return Card(
+            title="LLM connection " + ("ok" if test.ok else "FAILED"),
+            fields=[
+                Field("Provider", self._llm_summary()),
+                Field("Result", f"{test.latency_ms}ms - {truncate(test.detail or test.error, 500)}"),
+            ],
+            tone=Tone.SUCCESS if test.ok else Tone.CRITICAL,
+        )
+
+    # -- cards -----------------------------------------------------------------
 
     async def _status_card(self, title: str = "Status") -> Card:
         health = await self.docker.health()
@@ -538,16 +833,20 @@ class Agent:
         fields = [
             Field("Docker", health.detail if health.ok else f"UNREACHABLE: {health.error}"),
             Field("Monitored", "\n".join(lines) or "_no labelled containers_"),
+        ]
+        if self.ssh is not None:
+            h = await self.ssh.health()
+            fields.append(Field(
+                "Remote host",
+                h.detail if h.ok else f"UNREACHABLE: {truncate(h.error, 300)}",
+            ))
+        fields += [
             Field(
                 "Open incidents",
                 "\n".join(f"`{i.id}` {i.state.value} - {truncate(i.title, 90)}" for i in open_)
                 or "none",
             ),
-            Field(
-                "Reasoning",
-                MODEL_ID if not self.settings.llm_configured else "LLM configured",
-                inline=True,
-            ),
+            Field("Reasoning", self._llm_summary()),
             Field("Autonomy", self.policy.config.autonomy.value, inline=True),
         ]
         tone = Tone.CRITICAL if open_ else Tone.SUCCESS
@@ -569,36 +868,48 @@ class Agent:
         if incident.id in self._busy:
             return "A remediation is in flight; diagnosis is frozen until it finishes."
         container = incident.signals[0].raw.get("container", f"demo-{incident.service}")
-        result = await self.triage.investigate(incident, container)
-        incident.diagnosis = result.diagnosis
-        incident.log("user:" + cmd.user.display_name, "rediagnosed")
-        return diagnosis_card(incident, result.diagnosis)
+        if self.reasoner is not None:
+            try:
+                result = await self.reasoner.diagnose(incident, container)
+                diagnosis = result.diagnosis
+            except ReasonerError as exc:
+                return f"The model failed: `{truncate(str(exc), 400)}`"
+        else:
+            diagnosis = (await self.triage.investigate(incident, container)).diagnosis
+        incident.diagnosis = diagnosis
+        incident.log("user:" + cmd.user.display_name, "rediagnosed", diagnosis.model_id)
+        return diagnosis_card(incident, diagnosis)
 
     async def _discover_card(self) -> Card:
         states = await self.docker.inventory()
         lines = [f"`{s.name}` {s.status} {s.image}" for s in states]
-        return Card(
-            title="Discovery",
-            fields=[
-                Field("Local Docker", "\n".join(lines) or "nothing labelled for monitoring"),
-                Field("Remote hosts", "No SSH hosts configured yet."),
-            ],
-            tone=Tone.INFO,
-        )
+        fields = [Field("Local Docker", "\n".join(lines) or "nothing labelled for monitoring")]
+        if self.ssh is None:
+            fields.append(Field("Remote host", "Not configured (set OPSLOOP_SSH_HOST)."))
+        else:
+            inv = await self.ssh.discover()
+            if not inv.hostname and inv.errors:
+                fields.append(Field("Remote host", "UNREACHABLE: " + truncate("; ".join(inv.errors[:2]), 900)))
+            else:
+                fields.append(Field(f"Remote host {inv.hostname}", "```" + truncate(inv.summarise(), 950) + "```"))
+                ok, why = inv.can_run_demo_stack()
+                fields.append(Field("Can host the demo stack", ("yes - " if ok else "no - ") + why))
+        return Card(title="Discovery", fields=fields, tone=Tone.INFO)
 
     def _settings_card(self) -> Card:
         s = self.settings
         return Card(
             title="Settings",
             fields=[
-                Field("Reasoning", "LLM configured" if s.llm_configured else
-                      f"{MODEL_ID}. No LLM provider configured yet - rule-based triage "
-                      "handles known failure shapes and abstains on the rest."),
+                Field("Reasoning", self._llm_summary() + "\nRules run first; the model handles what they abstain on."),
+                Field("Change it", "`/llm` opens the provider menu. Any OpenAI-compatible base URL works. "
+                      "Presets: " + ", ".join(sorted(PRESETS_BY_KEY))),
                 Field("Autonomy", s.autonomy.value, inline=True),
                 Field("Approvers", s.discord_admin_role or "server administrators", inline=True),
                 Field("Verification",
                       f"{s.verify_window_seconds}s window, poll {s.verify_poll_seconds}s, "
                       f"{s.verify_required_passes} consecutive passes", inline=True),
+                Field("Remote host", f"{s.ssh_user}@{s.ssh_host}" if s.ssh_host else "none", inline=True),
                 Field("Demo stack", "enabled" if s.demo_enabled else "disabled", inline=True),
                 Field("Executors", truncate(
                     ", ".join(sorted(e.id for e in self.executors.all())), 1000)),
@@ -658,16 +969,30 @@ class Agent:
 
     async def handle_question(self, q: ChatQuestion) -> Card | str:
         open_ = self.store.open()
-        summary = (
-            "\n".join(f"- `{i.id}` {i.state.value}: {truncate(i.title, 100)}" for i in open_)
-            or "- nothing open"
+        if self.reasoner is None:
+            summary = "\n".join(
+                f"- `{i.id}` {i.state.value}: {truncate(i.title, 100)}" for i in open_
+            ) or "- nothing open"
+            return (
+                "No LLM is configured, so I can only answer with slash commands. "
+                "An administrator can add one with `/llm`.\n\n"
+                f"**Open incidents**\n{summary}"
+            )
+        context = "Open incidents: " + (
+            "; ".join(f"{i.id} ({i.state.value}) {i.title}" for i in open_) or "none"
         )
-        return (
-            "Free-text reasoning needs an LLM provider, and none is configured yet - "
-            "that is the next piece being built. Rule-based triage is running and "
-            "watching production in the meantime.\n\n"
-            f"**Open incidents**\n{summary}\n\n"
-            "Try `/status`, `/incidents` or `/incident <id>`."
+        try:
+            answer = await self.reasoner.ask(q.text, context=context)
+        except ReasonerError as exc:
+            return f"The model could not answer: `{truncate(str(exc), 500)}`"
+        return Card(
+            title=truncate(q.text, 240),
+            body=truncate(format_answer(answer), 4000),
+            tone=Tone.SECURITY if any(e.tainted for e in answer.evidence) else Tone.INFO,
+            footer=(
+                f"{answer.model} - {len(answer.tool_calls)} tool call(s), "
+                f"{answer.usage.total_tokens} tokens"
+            ),
         )
 
 
@@ -717,6 +1042,9 @@ def main() -> None:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
     logging.getLogger("discord").setLevel(logging.WARNING)
+    # paramiko prints a full traceback for every refused handshake; the SSH
+    # adapter already reports the failure in one readable line.
+    logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     try:
         asyncio.run(run())
     except KeyboardInterrupt:

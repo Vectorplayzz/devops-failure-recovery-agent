@@ -14,3 +14,6 @@ opsloop.egg-info/
 # from it by adding an explicit exception below.
 docs/*
 !docs/DISCORD_SETUP.md
+
+# Runtime settings written by the /llm menu - holds API keys.
+opsloop-settings.json

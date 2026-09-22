@@ -126,11 +126,12 @@ redacted before anything leaves the machine.
 | Console surface | ✅ done |
 | Runtime: monitor → triage → approve → execute → verify | ✅ done — `python -m opsloop` |
 | Rule-based triage (grounded, abstains when unsure) | ✅ done |
-| Agent reasoning loop (LLM ↔ tools) | ⬜ next |
-| Settings UI | ⬜ next |
+| Agent reasoning loop (LLM with read-only tools, grounded) | ✅ done — verified live on Groq |
+| Settings menu: any provider, any OpenAI-compatible URL | ✅ done — `/llm` in Discord |
+| Remote host monitoring over SSH (disk, units, memory) | ✅ done — waiting on a key install |
 | Teams surface | ⬜ optional — a third implementation of a settled interface |
 
-**126 tests passing** in ~6.5s, plus an end-to-end proof against the live stack.
+**163 tests passing** in ~9s, plus an end-to-end proof against the live stack.
 
 ## The closed loop, proven
 

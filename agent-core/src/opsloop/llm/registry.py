@@ -103,7 +103,8 @@ PRESETS: tuple[Preset, ...] = (
         "Groq",
         ProviderKind.OPENAI_COMPATIBLE,
         "https://api.groq.com/openai/v1",
-        ("llama-3.3-70b-versatile",),
+        ("openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"),
+        hint="Fast, free tier. All three suggested models support tool calling.",
     ),
     Preset(
         "together",

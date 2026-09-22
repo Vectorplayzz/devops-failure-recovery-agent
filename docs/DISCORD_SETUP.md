@@ -64,6 +64,8 @@ screenshot or paste, reset it in the developer portal immediately.
 | `/diagnose <id>` | investigate now |
 | `/discover` | inventory the configured hosts |
 | `/settings` | active LLM provider and adapters |
+| `/llm` | **settings menu**: choose the LLM provider, model, base URL and key (admins) |
+| `/llm_test` | check the active LLM provider responds |
 | `/ask <question>` | ask in natural language |
 | `@OpsLoop ...` | same, conversationally (needs the message-content intent) |
 | `/inject <scenario>` | demo only: break the demo stack on purpose |
@@ -99,6 +101,57 @@ the corrected build** (MEDIUM). Approve the restart first to watch verification
 catch the relapse and roll it back; then approve the real fix and watch it hold.
 
 With no `OPSLOOP_DISCORD_TOKEN` set, the same agent runs in the terminal.
+
+## 7. Connect an LLM
+
+`/llm` opens a private form - not slash-command options, because those are
+visible to everyone in the channel and one field is an API key. Fill in:
+
+- **Provider**: a preset (`groq`, `openai`, `anthropic`, `openrouter`,
+  `ollama`, `google`, `deepseek`, ...) or any label you like
+- **Base URL**: blank for a preset, or **any OpenAI-compatible endpoint**
+  (vLLM, LM Studio, a gateway, your own server)
+- **API key**: blank keeps the current one
+- **Model**: blank for the preset's default
+
+The new provider is **connection-tested before it replaces the old one**, so a
+typo cannot silently cut the agent's reasoning off. The choice is saved to
+`agent-core/opsloop-settings.json` (gitignored) and survives restarts.
+`.env` (`OPSLOOP_LLM_PROVIDER`, `_BASE_URL`, `_API_KEY`, `_MODEL`) is only the
+starting point.
+
+With a model connected, `/ask` and `@OpsLoop` answer from live telemetry and
+cite the evidence they used. Rule-based triage still handles the failures it
+recognises - instantly and for free - and the model takes the ones it
+abstains on.
+
+## 8. Connect a remote host (VPS)
+
+In `agent-core/.env`:
+
+```
+OPSLOOP_SSH_HOST=your.host
+OPSLOOP_SSH_USER=user
+OPSLOOP_SSH_KEY=~/.ssh/opsloop_ed25519
+```
+
+Use a **dedicated key without a passphrase** - an unattended agent cannot type
+one - and install it on the host once:
+
+```bash
+ssh-keygen -t ed25519 -N "" -C opsloop-agent -f ~/.ssh/opsloop_ed25519
+ssh-copy-id -i ~/.ssh/opsloop_ed25519.pub user@your.host
+```
+
+Revoke it any time by deleting its line from `~/.ssh/authorized_keys` on the
+host. The agent then watches for a full disk, failed systemd units and memory
+exhaustion, and the model gains read-only tools for journald, log files and
+disk usage.
+
+If the host refuses the connection the agent **backs off** - 15 seconds,
+doubling to 10 minutes - rather than retrying every probe. Retrying a failing
+login in a loop looks exactly like brute force and gets your own address
+banned by fail2ban.
 
 ## Why Discord is fine here (and where it is not)
 

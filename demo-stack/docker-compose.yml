@@ -41,6 +41,11 @@ services:
       timeout: 3s
       retries: 10
     mem_limit: 256m
+    # Without a restart policy the database silently stays down after Docker
+    # (or the host) restarts, while every service that depends on it comes
+    # back. Found by the agent itself: asked "is anything broken?", it
+    # reported postgres had been exited for 23 hours.
+    restart: unless-stopped
     labels:
       opsloop.role: datastore
       opsloop.environment: production

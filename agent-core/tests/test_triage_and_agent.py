@@ -35,6 +35,13 @@ from opsloop.domain.models import CheckOutcome
 
 _SAN = TelemetrySanitiser()
 
+import os as _os
+import tempfile as _tempfile
+from pathlib import Path as _Path
+
+_ISOLATED_SETTINGS = _Path(_tempfile.gettempdir()) / "opsloop-test-settings-does-not-exist.json"
+_os.environ.pop("OPSLOOP_LLM_PROVIDER", None)  # env must not leak a real provider in either
+
 HEAP_LOGS = "\n".join(
     f'{{"level": "WARNING", "msg": "allocation pressure while building order batch", "heap_mb": {12 * i}}}'
     for i in range(1, 15)
@@ -191,7 +198,10 @@ def make_agent(*, verified: bool = True, demo: bool = True) -> tuple[FastAgent, 
     calls: list[str] = []
     executors = _executors(calls)
     agent = FastAgent(
-        Settings(demo_enabled=demo, error_burst_threshold=5),
+        # Never the real settings file: once someone saves a provider through
+        # /llm, a test run must not start spending their API quota.
+        Settings(demo_enabled=demo, error_burst_threshold=5,
+                 settings_file=str(_ISOLATED_SETTINGS)),
         surface,
         docker_adapter=docker,
         executors=executors,
@@ -456,7 +466,7 @@ class TestCommands:
         reply = await agent.handle_question(
             ChatQuestion(text="what's broken?", user=ADMIN, channel_id="c", surface="test")
         )
-        assert "none is configured" in reply
+        assert "No LLM is configured" in reply
 
     async def test_inject_requires_admin(self) -> None:
         agent, _, _, _ = make_agent()
